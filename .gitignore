@@ -1,0 +1,8 @@
+documents
+.streamlit
+.venv
+filled.docx
+app.py
+main.py
+main2.py
+__pycache__
