@@ -253,7 +253,7 @@ def replace_in_paragraph(p, replacements: dict):
 
     # Clear any leftover red formatting on runs that no longer contain placeholders
     _clear_red_on_non_placeholder_runs(p, repl)
-    # _clear_paragraph_bullet_color(p)
+    _clear_paragraph_bullet_color(p)
 
 
 def _clear_paragraph_bullet_color(p):
@@ -599,7 +599,7 @@ def process_and_fill(files: dict) -> str:
 
         out = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
         doc.save(out.name)
-        _apply_footnotes_xml_fallback_in_place(out.name, replacements)
+        # _apply_footnotes_xml_fallback_in_place(out.name, replacements)
         # _scrub_list_number_colors(out.name)
 
         return out.name
