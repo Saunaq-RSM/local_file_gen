@@ -6,10 +6,20 @@ from docx import Document
 import openpyxl
 import pdfplumber
 import pandas as pd
-
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 # NEW: pptx support
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
+from docx.text.paragraph import Paragraph
+from zipfile import ZipFile
+from lxml import etree
+from io import BytesIO
+from docx.oxml.ns import qn
+from docx.shared import RGBColor
+from zipfile import ZipFile
+from lxml import etree
+
 
 # ——— Azure OpenAI config ———
 # Expect these to be set by the Streamlit frontend via secrets or environment variables
@@ -77,6 +87,20 @@ def load_pdf(file) -> str:
         return "\n\n".join(pages + tables)
     except Exception:
         return ""
+
+def enable_field_update_on_open(doc: Document) -> None:
+    """
+    Set w:updateFields in document settings so Word updates fields (e.g., TOC)
+    on open. Safe to call multiple times.
+    """
+    settings = doc.settings.element
+    # Look for existing <w:updateFields>
+    update_fields = settings.find(qn('w:updateFields'))
+    if update_fields is None:
+        update_fields = OxmlElement('w:updateFields')
+        settings.append(update_fields)
+    update_fields.set(qn('w:val'), 'true')
+
 
 
 def load_guidelines(file) -> str:
@@ -168,16 +192,170 @@ def collapse_runs(paragraph):
     paragraph.add_run(text)
 
 
-def replace_in_paragraph(p, replacements):
-    collapse_runs(p)
+def replace_in_paragraph(p, replacements: dict):
+    """
+    Hybrid replacer:
+      1) Concatenate all <w:t> texts.
+      2) Do full-string replacements (handles placeholders split across runs).
+      3) Write back across the SAME number of <w:t> nodes using original lengths.
+      4) Preserve spaces via xml:space="preserve".
+    Also triggers color cleanup for runs that no longer contain placeholders.
+    """
+    if not replacements:
+        return
+
+    # ensure keys/values are strings
+    repl = {str(k): ("" if v is None else str(v)) for k, v in replacements.items()}
+
+    p_elm = p._p
+    ns = p_elm.nsmap or {
+        "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+        "xml": "http://www.w3.org/XML/1998/namespace",
+    }
+
+    t_nodes = p_elm.findall(".//w:t", namespaces=ns)
+    if not t_nodes:
+        return
+
+    originals = [(t, t.text or "") for t in t_nodes]
+    full = "".join(txt for _, txt in originals)
+    if not full:
+        return
+
+    # Fast exit if no placeholder appears anywhere in this paragraph
+    if not any(k in full for k in repl.keys()):
+        return
+
+    # Perform replacements on the concatenated text
+    new_full = full
+    for ph, val in repl.items():
+        if ph in new_full:
+            new_full = new_full.replace(ph, val)
+
+    if new_full == full:
+        return  # no change
+
+    # Redistribute back using original lengths to keep run boundaries intact
+    lengths = [len(txt) for _, txt in originals]
+    pos = 0
+    n = len(originals)
+    for i in range(n):
+        t, _oldtxt = originals[i]
+        take = lengths[i] if i < n - 1 else max(0, len(new_full) - pos)
+        # slice safely
+        segment = new_full[pos:pos + take] if take >= 0 else ""
+        t.text = segment
+        pos += lengths[i] if i < n - 1 else len(new_full) - pos
+
+        # Preserve leading/trailing spaces for this text node
+        if segment and (segment[0].isspace() or segment[-1].isspace()):
+            t.set(qn("xml:space"), "preserve")
+
+    # Clear any leftover red formatting on runs that no longer contain placeholders
+    _clear_red_on_non_placeholder_runs(p, repl)
+    # _clear_paragraph_bullet_color(p)
+
+
+def _clear_paragraph_bullet_color(p):
+    try:
+        if p.style and p.style.font and getattr(p.style.font, "color", None):
+            p.style.font.color.rgb = None
+            p.style.font.color.theme_color = None
+    except Exception:
+        pass
+
+def _run_is_explicit_red(run) -> bool:
+    c = getattr(run.font, "color", None)
+    if not c or getattr(c, "rgb", None) is None:
+        return False
+    try:
+        r, g, b = c.rgb[0], c.rgb[1], c.rgb[2]
+        return (200 <= r <= 255 and 0 <= g <= 80 and 0 <= b <= 80) or (r >= 100 and b <=20 and g <=20)
+    except Exception:
+        return False
+
+def _clear_run_color(run):
+    if getattr(run.font, "color", None):
+        try:
+            run.font.color.rgb = None
+        except Exception:
+            pass
+        try:
+            run.font.color.theme_color = None
+        except Exception:
+            pass
+
+def _clear_red_on_non_placeholder_runs(p, replacements: dict):
+    keys = list(replacements.keys())
     for run in p.runs:
-        for ph, val in replacements.items():
-            if ph in run.text:
-                run.text = run.text.replace(ph, val)
+        text = run.text or ""
+        if not text:
+            continue
+        # If this run used to be a placeholder (red), but now has no placeholders, clear color
+        if _run_is_explicit_red(run):
+            if (not any(k in text for k in keys)) and ("{{" not in text and "}}" not in text):
+                _clear_run_color(run)
+
+
+
+
+def _rewrite_footnotes_xml_bytes(docx_bytes: bytes, replacements: dict) -> bytes:
+    """
+    Open a .docx (zip) from bytes, replace placeholders inside word/footnotes.xml,
+    and return new .docx bytes. If footnotes.xml is missing, return the original bytes.
+    """
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    with ZipFile(BytesIO(docx_bytes)) as zin:
+        names = {i.filename for i in zin.infolist()}
+        if "word/footnotes.xml" not in names:
+            return docx_bytes  # no footnotes part
+
+        # Read and parse original footnotes.xml
+        foot_xml = zin.read("word/footnotes.xml")
+        root = etree.fromstring(foot_xml)
+
+        # Replace inside every w:t under w:footnote
+        # (Note: this is robust for tokens contained in a single text node.
+        # If your placeholders can split across runs, prefer the python-docx path.)
+        for t in root.findall(".//w:footnote//w:t", namespaces=ns):
+            if t.text:
+                new_text = t.text
+                for ph, val in replacements.items():
+                    if ph in new_text:
+                        new_text = new_text.replace(ph, val)
+                if new_text != t.text:
+                    t.text = new_text
+
+        # Build a new .docx with modified footnotes.xml
+        out_buf = BytesIO()
+        with ZipFile(out_buf, "w") as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if item.filename == "word/footnotes.xml":
+                    data = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone="yes")
+                zout.writestr(item, data)
+        return out_buf.getvalue()
+
+
+def _apply_footnotes_xml_fallback_in_place(docx_path: str, replacements: dict) -> None:
+    """
+    Read a saved .docx from disk, run the XML fallback, and overwrite it in place.
+    Safe no-op if the document has no footnotes.xml.
+    """
+    try:
+        with open(docx_path, "rb") as f:
+            original = f.read()
+        updated = _rewrite_footnotes_xml_bytes(original, replacements)
+        if updated != original:
+            with open(docx_path, "wb") as f:
+                f.write(updated)
+    except Exception:
+        # Be defensive: never fail the whole pipeline if footnote rewrite trips.
+        pass
 
 
 def replace_placeholders_docx(doc: Document, replacements: dict):
-    """Replace placeholders AFTER the first page break (mirrors your original behavior)."""
+    """Replace placeholders AFTER the first page break, preserving images and footnotes."""
     from docx.oxml.ns import qn
     seen = False
     br_tag = qn('w:br')
@@ -193,11 +371,15 @@ def replace_placeholders_docx(doc: Document, replacements: dict):
             if not seen:
                 continue
         replace_in_paragraph(p, replacements)
+
+    # Tables
     for tbl in doc.tables:
         for row in tbl.rows:
             for cell in row.cells:
                 for p in cell.paragraphs:
                     replace_in_paragraph(p, replacements)
+
+    # Headers/footers
     for sec in doc.sections:
         if sec.header:
             for p in sec.header.paragraphs:
@@ -205,6 +387,8 @@ def replace_placeholders_docx(doc: Document, replacements: dict):
         if sec.footer:
             for p in sec.footer.paragraphs:
                 replace_in_paragraph(p, replacements)
+
+    # Footnotes (if present)
 
 
 def replace_first_page_placeholders_docx(doc: Document, replacements: dict):
@@ -341,6 +525,7 @@ def _build_fallback_docx(replacements: dict, context: str) -> str:
         doc.add_heading("Context (truncated)", level=2)
         doc.add_paragraph(context[:4000])  # keep file small
 
+    enable_field_update_on_open(doc)
     out = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
     doc.save(out.name)
     return out.name
@@ -400,7 +585,6 @@ def process_and_fill(files: dict) -> str:
         return out.name
 
     elif is_docx:
-        # --- Word path (kept for compatibility) ---
         try:
             doc = Document(template)
         except Exception:
@@ -408,8 +592,16 @@ def process_and_fill(files: dict) -> str:
 
         replace_first_page_placeholders_docx(doc, replacements)
         replace_placeholders_docx(doc, replacements)
+
+
+        # NEW: ensure Word updates TOC/fields on open
+        enable_field_update_on_open(doc)
+
         out = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
         doc.save(out.name)
+        _apply_footnotes_xml_fallback_in_place(out.name, replacements)
+        # _scrub_list_number_colors(out.name)
+
         return out.name
 
     else:
