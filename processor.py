@@ -252,8 +252,8 @@ def replace_in_paragraph(p, replacements: dict):
             t.set(qn("xml:space"), "preserve")
 
     # Clear any leftover red formatting on runs that no longer contain placeholders
-    _clear_red_on_non_placeholder_runs(p, repl)
-    _clear_paragraph_bullet_color(p)
+    # _clear_red_on_non_placeholder_runs(p, repl)
+    # _clear_paragraph_bullet_color(p)
 
 
 def _clear_paragraph_bullet_color(p):
