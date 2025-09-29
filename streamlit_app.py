@@ -7,7 +7,7 @@ configure(
     st.secrets["AZURE_API_ENDPOINT"]
 )
 
-st.set_page_config(page_title="TP Template Filler", layout="wide")
+st.set_page_config(page_title="TP Agent 1 Reinvoicing", layout="wide")
 st.title("Transfer Pricing Document Filler")
 
 uploaded = st.file_uploader(
