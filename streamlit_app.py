@@ -8,7 +8,7 @@ configure(
 )
 
 st.set_page_config(page_title="TP Agent 1 Reinvoicing", layout="wide")
-st.title("Transfer Pricing Document Filler")
+st.title("TP Agent 1 Reinvoicing")
 
 uploaded = st.file_uploader(
     "Upload: OECD text (.txt), transcript (.docx), analysis (.pdf), variables (.xlsx), and template (.pptx/.docx).",
