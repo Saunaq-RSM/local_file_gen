@@ -302,7 +302,9 @@ def _clear_red_on_non_placeholder_runs(p, replacements: dict):
 def _rewrite_footnotes_xml_bytes(docx_bytes: bytes, replacements: dict) -> bytes:
     """
     Open a .docx (zip) from bytes, replace placeholders inside word/footnotes.xml,
-    and return new .docx bytes. If footnotes.xml is missing, return the original bytes.
+    and return new .docx bytes. This version collapses runs inside each footnote
+    so placeholders split across runs (the common cause of non-replacement) are handled.
+    If footnotes.xml is missing, return the original bytes.
     """
     ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
     with ZipFile(BytesIO(docx_bytes)) as zin:
@@ -310,21 +312,59 @@ def _rewrite_footnotes_xml_bytes(docx_bytes: bytes, replacements: dict) -> bytes
         if "word/footnotes.xml" not in names:
             return docx_bytes  # no footnotes part
 
-        # Read and parse original footnotes.xml
+        # Read and parse original footnotes.xml (be tolerant)
         foot_xml = zin.read("word/footnotes.xml")
-        root = etree.fromstring(foot_xml)
+        parser = etree.XMLParser(ns_clean=True, recover=True)
+        root = etree.fromstring(foot_xml, parser=parser)
 
-        # Replace inside every w:t under w:footnote
-        # (Note: this is robust for tokens contained in a single text node.
-        # If your placeholders can split across runs, prefer the python-docx path.)
-        for t in root.findall(".//w:footnote//w:t", namespaces=ns):
-            if t.text:
-                new_text = t.text
-                for ph, val in replacements.items():
-                    if ph in new_text:
-                        new_text = new_text.replace(ph, val)
-                if new_text != t.text:
-                    t.text = new_text
+        changed = False
+
+        # Iterate each w:footnote element
+        for footnote in root.findall(".//w:footnote", namespaces=ns):
+            # Collect runs that contain a w:t in document order
+            r_with_t = []
+            for r in footnote.findall(".//w:r", namespaces=ns):
+                t = r.find(".//w:t", namespaces=ns)
+                if t is not None:
+                    r_with_t.append((r, t))
+
+            if not r_with_t:
+                continue
+
+            # Build full concatenated text for this footnote (preserves order)
+            full = "".join((t.text or "") for (_r, t) in r_with_t)
+            if not full:
+                continue
+
+            # Perform replacements on the concatenated text
+            new_full = full
+            for ph, val in (replacements or {}).items():
+                if ph in new_full:
+                    new_full = new_full.replace(ph, val)
+
+            # If changed, collapse runs: put new_full into first w:t and remove subsequent run nodes
+            if new_full != full:
+                changed = True
+                first_r, first_t = r_with_t[0]
+                first_t.text = new_full
+
+                # Remove subsequent run elements that contained w:t (this collapses runs)
+                for r, t in r_with_t[1:]:
+                    parent = r.getparent()
+                    if parent is not None:
+                        try:
+                            parent.remove(r)
+                        except Exception:
+                            # be defensive: if removal fails, just clear inner text
+                            try:
+                                # clear any text nodes inside
+                                t.text = ""
+                            except Exception:
+                                pass
+
+        # If no change, return original bytes
+        if not changed:
+            return docx_bytes
 
         # Build a new .docx with modified footnotes.xml
         out_buf = BytesIO()
