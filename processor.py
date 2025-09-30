@@ -599,7 +599,7 @@ def process_and_fill(files: dict) -> str:
 
         out = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
         doc.save(out.name)
-        # _apply_footnotes_xml_fallback_in_place(out.name, replacements)
+        _apply_footnotes_xml_fallback_in_place(out.name, replacements)
         # _scrub_list_number_colors(out.name)
 
         return out.name
