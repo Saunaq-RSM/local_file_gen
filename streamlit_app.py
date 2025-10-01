@@ -11,7 +11,7 @@ st.set_page_config(page_title="TP Agent 1 Reinvoicing", layout="wide")
 st.title("TP Agent 1 Reinvoicing")
 
 uploaded = st.file_uploader(
-    "Upload: OECD text (.txt), transcript (.docx), analysis (.pdf), variables (.xlsx), and template (.pptx/.docx).",
+    "Upload: transcript (.docx), analysis (.pdf), variables (.xlsx), and template (.pptx/.docx).",
     type=["txt", "docx", "pdf", "xlsx", "pptx"],
     accept_multiple_files=True
 )
